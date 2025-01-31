@@ -1,255 +1,438 @@
 // Take a look at the license at the top of the repository in the LICENSE file.
 
-use crate::{DiskExt, DiskType};
+use crate::sys::utils::HandleWrapper;
+use crate::{Disk, DiskKind, DiskRefreshKind, DiskUsage};
 
 use std::ffi::{OsStr, OsString};
 use std::mem::size_of;
+use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 
-use winapi::ctypes::c_void;
-use winapi::shared::minwindef::{DWORD, MAX_PATH};
-use winapi::um::fileapi::{
-    CreateFileW, GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
-    OPEN_EXISTING,
+use windows::core::{Error, HRESULT, PCWSTR};
+use windows::Win32::Foundation::MAX_PATH;
+use windows::Win32::Storage::FileSystem::{
+    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW, GetDriveTypeW,
+    GetVolumeInformationW, GetVolumePathNamesForVolumeNameW,
 };
-use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-use winapi::um::ioapiset::DeviceIoControl;
-use winapi::um::winbase::{DRIVE_FIXED, DRIVE_REMOVABLE};
-use winapi::um::winioctl::{
-    PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, IOCTL_STORAGE_QUERY_PROPERTY,
-    STORAGE_PROPERTY_QUERY,
+use windows::Win32::System::Ioctl::{
+    PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR,
+    DISK_PERFORMANCE, IOCTL_DISK_PERFORMANCE, IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY,
 };
-use winapi::um::winnt::{BOOLEAN, FILE_SHARE_READ, FILE_SHARE_WRITE, HANDLE, ULARGE_INTEGER};
+use windows::Win32::System::SystemServices::FILE_READ_ONLY_VOLUME;
+use windows::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
+use windows::Win32::System::IO::DeviceIoControl;
 
-#[doc = include_str!("../../md_doc/disk.md")]
-pub struct Disk {
-    type_: DiskType,
+/// Creates a copy of the first zero-terminated wide string in `buf`.
+/// The copy includes the zero terminator.
+fn from_zero_terminated(buf: &[u16]) -> Vec<u16> {
+    let end = buf.iter().position(|&x| x == 0).unwrap_or(buf.len());
+    buf[..=end].to_vec()
+}
+
+// Realistically, volume names are probably not longer than 44 characters,
+// but the example in the Microsoft documentation uses MAX_PATH as well.
+// https://learn.microsoft.com/en-us/windows/win32/fileio/displaying-volume-paths
+const VOLUME_NAME_SIZE: usize = MAX_PATH as usize + 1;
+
+const ERROR_NO_MORE_FILES: HRESULT = windows::Win32::Foundation::ERROR_NO_MORE_FILES.to_hresult();
+const ERROR_MORE_DATA: HRESULT = windows::Win32::Foundation::ERROR_MORE_DATA.to_hresult();
+
+/// Returns a list of zero-terminated wide strings containing volume GUID paths.
+/// Volume GUID paths have the form `\\?\{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\`.
+///
+/// Rather confusingly, the Win32 API _also_ calls these "volume names".
+pub(crate) fn get_volume_guid_paths() -> Vec<Vec<u16>> {
+    let mut volume_names = Vec::new();
+    unsafe {
+        let mut buf = Box::new([0u16; VOLUME_NAME_SIZE]);
+        let Ok(handle) = FindFirstVolumeW(&mut buf[..]) else {
+            sysinfo_debug!(
+                "Error: FindFirstVolumeW() = {:?}",
+                Error::from_win32().code()
+            );
+            return Vec::new();
+        };
+        volume_names.push(from_zero_terminated(&buf[..]));
+        loop {
+            if FindNextVolumeW(handle, &mut buf[..]).is_err() {
+                if Error::from_win32().code() != ERROR_NO_MORE_FILES {
+                    sysinfo_debug!("Error: FindNextVolumeW = {}", Error::from_win32().code());
+                }
+                break;
+            }
+            volume_names.push(from_zero_terminated(&buf[..]));
+        }
+        if FindVolumeClose(handle).is_err() {
+            sysinfo_debug!("Error: FindVolumeClose = {:?}", Error::from_win32().code());
+        };
+    }
+    volume_names
+}
+
+/// Given a volume GUID path (`\\?\{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\`), returns all
+/// volume paths (drive letters and mount paths) associated with it
+/// as zero terminated wide strings.
+///
+/// # Safety
+/// `volume_name` must contain a zero-terminated wide string.
+pub(crate) unsafe fn get_volume_path_names_for_volume_name(
+    volume_guid_path: &[u16],
+) -> Vec<Vec<u16>> {
+    let volume_guid_path = PCWSTR::from_raw(volume_guid_path.as_ptr());
+
+    // Initial buffer size is just a guess. There is no direct connection between MAX_PATH
+    // the output of GetVolumePathNamesForVolumeNameW.
+    let mut path_names_buf = vec![0u16; MAX_PATH as usize];
+    let mut path_names_output_size = 0u32;
+    for _ in 0..10 {
+        let volume_path_names = GetVolumePathNamesForVolumeNameW(
+            volume_guid_path,
+            Some(path_names_buf.as_mut_slice()),
+            &mut path_names_output_size,
+        );
+        let code = volume_path_names.map_err(|_| Error::from_win32().code());
+        match code {
+            Ok(()) => break,
+            Err(ERROR_MORE_DATA) => {
+                // We need a bigger buffer. path_names_output_size contains the required buffer size.
+                path_names_buf = vec![0u16; path_names_output_size as usize];
+                continue;
+            }
+            Err(_e) => {
+                sysinfo_debug!("Error: GetVolumePathNamesForVolumeNameW() = {}", _e);
+                return Vec::new();
+            }
+        }
+    }
+
+    // path_names_buf contains multiple zero terminated wide strings.
+    // An additional zero terminates the list.
+    let mut path_names = Vec::new();
+    let mut buf = &path_names_buf[..];
+    while !buf.is_empty() && buf[0] != 0 {
+        let path = from_zero_terminated(buf);
+        buf = &buf[path.len()..];
+        path_names.push(path);
+    }
+    path_names
+}
+
+pub(crate) struct DiskInner {
+    type_: DiskKind,
     name: OsString,
-    file_system: Vec<u8>,
+    file_system: OsString,
     mount_point: Vec<u16>,
-    s_mount_point: String,
+    s_mount_point: OsString,
     total_space: u64,
     available_space: u64,
     is_removable: bool,
+    is_read_only: bool,
+    device_path: Vec<u16>,
+    old_written_bytes: u64,
+    old_read_bytes: u64,
+    written_bytes: u64,
+    read_bytes: u64,
+    updated: bool,
 }
 
-impl DiskExt for Disk {
-    fn type_(&self) -> DiskType {
+impl DiskInner {
+    pub(crate) fn kind(&self) -> DiskKind {
         self.type_
     }
 
-    fn name(&self) -> &OsStr {
+    pub(crate) fn name(&self) -> &OsStr {
         &self.name
     }
 
-    fn file_system(&self) -> &[u8] {
+    pub(crate) fn file_system(&self) -> &OsStr {
         &self.file_system
     }
 
-    fn mount_point(&self) -> &Path {
-        Path::new(&self.s_mount_point)
+    pub(crate) fn mount_point(&self) -> &Path {
+        self.s_mount_point.as_ref()
     }
 
-    fn total_space(&self) -> u64 {
+    pub(crate) fn total_space(&self) -> u64 {
         self.total_space
     }
 
-    fn available_space(&self) -> u64 {
+    pub(crate) fn available_space(&self) -> u64 {
         self.available_space
     }
 
-    fn is_removable(&self) -> bool {
+    pub(crate) fn is_removable(&self) -> bool {
         self.is_removable
     }
 
-    fn refresh(&mut self) -> bool {
-        if self.total_space != 0 {
+    pub(crate) fn is_read_only(&self) -> bool {
+        self.is_read_only
+    }
+
+    pub(crate) fn refresh_specifics(&mut self, refreshes: DiskRefreshKind) -> bool {
+        if refreshes.kind() || refreshes.io_usage() {
             unsafe {
-                let mut tmp: ULARGE_INTEGER = std::mem::zeroed();
-                if GetDiskFreeSpaceExW(
-                    self.mount_point.as_ptr(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &mut tmp,
-                ) != 0
+                if let Some(handle) =
+                    HandleWrapper::new_from_file(&self.device_path, Default::default())
                 {
-                    self.available_space = *tmp.QuadPart();
-                    return true;
+                    if refreshes.kind() && self.type_ == DiskKind::Unknown(-1) {
+                        self.type_ = get_disk_kind(&handle);
+                    }
+
+                    if refreshes.io_usage() {
+                        if let Some((read_bytes, written_bytes)) = get_disk_io(handle) {
+                            self.old_read_bytes = self.read_bytes;
+                            self.old_written_bytes = self.written_bytes;
+                            self.read_bytes = read_bytes;
+                            self.written_bytes = written_bytes;
+                        } else {
+                            sysinfo_debug!("Failed to update disk i/o stats");
+                        }
+                    }
                 }
             }
         }
-        false
+
+        if refreshes.storage() {
+            if let Some((total_space, available_space)) =
+                unsafe { get_drive_size(&self.mount_point) }
+            {
+                self.total_space = total_space;
+                self.available_space = available_space;
+            }
+        }
+        true
     }
-}
 
-struct HandleWrapper(HANDLE);
-
-impl HandleWrapper {
-    unsafe fn new(drive_name: &[u16], open_rights: DWORD) -> Option<Self> {
-        let handle = CreateFileW(
-            drive_name.as_ptr(),
-            open_rights,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        );
-        if handle == INVALID_HANDLE_VALUE {
-            CloseHandle(handle);
-            None
-        } else {
-            Some(Self(handle))
+    pub(crate) fn usage(&self) -> DiskUsage {
+        DiskUsage {
+            read_bytes: self.read_bytes.saturating_sub(self.old_read_bytes),
+            total_read_bytes: self.read_bytes,
+            written_bytes: self.written_bytes.saturating_sub(self.old_written_bytes),
+            total_written_bytes: self.written_bytes,
         }
     }
 }
 
-impl Drop for HandleWrapper {
-    fn drop(&mut self) {
+pub(crate) struct DisksInner {
+    pub(crate) disks: Vec<Disk>,
+}
+
+impl DisksInner {
+    pub(crate) fn new() -> Self {
+        Self {
+            disks: Vec::with_capacity(2),
+        }
+    }
+
+    pub(crate) fn from_vec(disks: Vec<Disk>) -> Self {
+        Self { disks }
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<Disk> {
+        self.disks
+    }
+
+    pub(crate) fn refresh_specifics(
+        &mut self,
+        remove_not_listed_disks: bool,
+        refreshes: DiskRefreshKind,
+    ) {
         unsafe {
-            CloseHandle(self.0);
+            get_list(&mut self.disks, remove_not_listed_disks, refreshes);
         }
+    }
+
+    pub(crate) fn list(&self) -> &[Disk] {
+        &self.disks
+    }
+
+    pub(crate) fn list_mut(&mut self) -> &mut [Disk] {
+        &mut self.disks
     }
 }
 
 unsafe fn get_drive_size(mount_point: &[u16]) -> Option<(u64, u64)> {
-    let mut total_size: ULARGE_INTEGER = std::mem::zeroed();
-    let mut available_space: ULARGE_INTEGER = std::mem::zeroed();
+    let mut total_size = 0;
+    let mut available_space = 0;
+    let lpdirectoryname = PCWSTR::from_raw(mount_point.as_ptr());
     if GetDiskFreeSpaceExW(
-        mount_point.as_ptr(),
-        std::ptr::null_mut(),
-        &mut total_size,
-        &mut available_space,
-    ) != 0
+        lpdirectoryname,
+        None,
+        Some(&mut total_size),
+        Some(&mut available_space),
+    )
+    .is_ok()
     {
-        Some((
-            *total_size.QuadPart() as _,
-            *available_space.QuadPart() as _,
-        ))
+        Some((total_size, available_space))
     } else {
         None
     }
 }
 
-// FIXME: To be removed once <https://github.com/retep998/winapi-rs/pull/1028> has been merged.
-#[allow(non_snake_case)]
-#[repr(C)]
-struct DEVICE_SEEK_PENALTY_DESCRIPTOR {
-    Version: DWORD,
-    Size: DWORD,
-    IncursSeekPenalty: BOOLEAN,
-}
+pub(crate) unsafe fn get_list(
+    disks: &mut Vec<Disk>,
+    remove_not_listed_disks: bool,
+    refreshes: DiskRefreshKind,
+) {
+    for volume_name in get_volume_guid_paths() {
+        let mount_paths = get_volume_path_names_for_volume_name(&volume_name[..]);
+        if mount_paths.is_empty() {
+            continue;
+        }
 
-pub(crate) unsafe fn get_disks() -> Vec<Disk> {
-    let drives = GetLogicalDrives();
-    if drives == 0 {
-        return Vec::new();
+        let raw_volume_name = PCWSTR::from_raw(volume_name.as_ptr());
+        let drive_type = GetDriveTypeW(raw_volume_name);
+
+        if drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE {
+            continue;
+        }
+
+        let is_removable = drive_type == DRIVE_REMOVABLE;
+
+        let mut name = [0u16; MAX_PATH as usize + 1];
+        let mut file_system = [0u16; 32];
+        let mut flags = 0;
+        let volume_info_res = GetVolumeInformationW(
+            raw_volume_name,
+            Some(&mut name),
+            None,
+            None,
+            Some(&mut flags),
+            Some(&mut file_system),
+        )
+        .is_ok();
+        if !volume_info_res {
+            sysinfo_debug!(
+                "Error: GetVolumeInformationW = {:?}",
+                Error::from_win32().code()
+            );
+            continue;
+        }
+        let is_read_only = (flags & FILE_READ_ONLY_VOLUME) != 0;
+
+        // The device path is the volume name without the trailing backslash.
+        let device_path = volume_name[..(volume_name.len() - 2)]
+            .iter()
+            .copied()
+            .chain([0])
+            .collect::<Vec<_>>();
+
+        let name = os_string_from_zero_terminated(&name);
+        let file_system = os_string_from_zero_terminated(&file_system);
+        for mount_path in mount_paths {
+            if let Some(disk) = disks
+                .iter_mut()
+                .find(|d| d.inner.mount_point == mount_path && d.inner.file_system == file_system)
+            {
+                disk.refresh_specifics(refreshes);
+                disk.inner.updated = true;
+                continue;
+            }
+            let mut disk = DiskInner {
+                type_: DiskKind::Unknown(-1),
+                name: name.clone(),
+                file_system: file_system.clone(),
+                s_mount_point: OsString::from_wide(&mount_path[..mount_path.len() - 1]),
+                mount_point: mount_path,
+                total_space: 0,
+                available_space: 0,
+                is_removable,
+                is_read_only,
+                device_path: device_path.clone(),
+                old_read_bytes: 0,
+                old_written_bytes: 0,
+                read_bytes: 0,
+                written_bytes: 0,
+                updated: true,
+            };
+            disk.refresh_specifics(refreshes);
+            disks.push(Disk { inner: disk });
+        }
     }
 
-    #[cfg(feature = "multithread")]
-    use rayon::iter::ParallelIterator;
-
-    crate::utils::into_iter(0..DWORD::BITS)
-        .filter_map(|x| {
-            if (drives >> x) & 1 == 0 {
-                return None;
+    if remove_not_listed_disks {
+        disks.retain_mut(|disk| {
+            if !disk.inner.updated {
+                return false;
             }
-            let mount_point = [b'A' as u16 + x as u16, b':' as u16, b'\\' as u16, 0];
+            disk.inner.updated = false;
+            true
+        });
+    } else {
+        for c in disks.iter_mut() {
+            c.inner.updated = false;
+        }
+    }
+}
 
-            let drive_type = GetDriveTypeW(mount_point.as_ptr());
+fn os_string_from_zero_terminated(name: &[u16]) -> OsString {
+    let len = name.iter().position(|&x| x == 0).unwrap_or(name.len());
+    OsString::from_wide(&name[..len])
+}
 
-            let is_removable = drive_type == DRIVE_REMOVABLE;
+unsafe fn get_disk_kind(handle: &HandleWrapper) -> DiskKind {
+    let spq_trim = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut result: DEVICE_SEEK_PENALTY_DESCRIPTOR = unsafe { std::mem::zeroed() };
 
-            if drive_type != DRIVE_FIXED && drive_type != DRIVE_REMOVABLE {
-                return None;
-            }
-            let mut name = [0u16; MAX_PATH + 1];
-            let mut file_system = [0u16; 32];
-            if GetVolumeInformationW(
-                mount_point.as_ptr(),
-                name.as_mut_ptr(),
-                name.len() as DWORD,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                file_system.as_mut_ptr(),
-                file_system.len() as DWORD,
-            ) == 0
-            {
-                return None;
-            }
-            let mut pos = 0;
-            for x in name.iter() {
-                if *x == 0 {
-                    break;
-                }
-                pos += 1;
-            }
-            let name = String::from_utf16_lossy(&name[..pos]);
-            let name = OsStr::new(&name);
+    let mut dw_size = 0;
+    let device_io_control = unsafe {
+        DeviceIoControl(
+            handle.0,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            Some(&spq_trim as *const STORAGE_PROPERTY_QUERY as *const _),
+            size_of::<STORAGE_PROPERTY_QUERY>() as _,
+            Some(&mut result as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR as *mut _),
+            size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as _,
+            Some(&mut dw_size),
+            None,
+        )
+        .is_ok()
+    };
 
-            pos = 0;
-            for x in file_system.iter() {
-                if *x == 0 {
-                    break;
-                }
-                pos += 1;
-            }
-            let file_system: Vec<u8> = file_system[..pos].iter().map(|x| *x as u8).collect();
+    if !device_io_control || dw_size != size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as _ {
+        DiskKind::Unknown(-1)
+    } else {
+        let is_hdd = result.IncursSeekPenalty.as_bool();
+        if is_hdd {
+            DiskKind::HDD
+        } else {
+            DiskKind::SSD
+        }
+    }
+}
 
-            let drive_name = [
-                b'\\' as u16,
-                b'\\' as u16,
-                b'.' as u16,
-                b'\\' as u16,
-                b'A' as u16 + x as u16,
-                b':' as u16,
-                0,
-            ];
-            let handle = HandleWrapper::new(&drive_name, 0)?;
-            let (total_space, available_space) = get_drive_size(&mount_point)?;
-            if total_space == 0 {
-                return None;
-            }
-            let mut spq_trim = STORAGE_PROPERTY_QUERY {
-                PropertyId: StorageDeviceSeekPenaltyProperty,
-                QueryType: PropertyStandardQuery,
-                AdditionalParameters: [0],
-            };
-            let mut result: DEVICE_SEEK_PENALTY_DESCRIPTOR = std::mem::zeroed();
+/// Returns a tuple consisting of the total number of bytes read and written by the volume with the
+/// specified device path
+fn get_disk_io(handle: HandleWrapper) -> Option<(u64, u64)> {
+    let mut disk_perf = DISK_PERFORMANCE::default();
+    let mut bytes_returned = 0;
 
-            let mut dw_size = 0;
-            let type_ = if DeviceIoControl(
-                handle.0,
-                IOCTL_STORAGE_QUERY_PROPERTY,
-                &mut spq_trim as *mut STORAGE_PROPERTY_QUERY as *mut c_void,
-                size_of::<STORAGE_PROPERTY_QUERY>() as DWORD,
-                &mut result as *mut DEVICE_SEEK_PENALTY_DESCRIPTOR as *mut c_void,
-                size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as DWORD,
-                &mut dw_size,
-                std::ptr::null_mut(),
-            ) == 0
-                || dw_size != size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as DWORD
-            {
-                DiskType::Unknown(-1)
-            } else {
-                let is_ssd = result.IncursSeekPenalty == 0;
-                if is_ssd {
-                    DiskType::SSD
-                } else {
-                    DiskType::HDD
-                }
-            };
-            Some(Disk {
-                type_,
-                name: name.to_owned(),
-                file_system: file_system.to_vec(),
-                mount_point: mount_point.to_vec(),
-                s_mount_point: String::from_utf16_lossy(&mount_point[..mount_point.len() - 1]),
-                total_space,
-                available_space,
-                is_removable,
-            })
-        })
-        .collect::<Vec<_>>()
+    // SAFETY: the handle is checked for validity above
+    unsafe {
+        // See <https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-ioctl_disk_performance> for reference
+        DeviceIoControl(
+            handle.0,
+            IOCTL_DISK_PERFORMANCE,
+            None, // Must be None as per docs
+            0,
+            Some(&mut disk_perf as *mut _ as _),
+            size_of::<DISK_PERFORMANCE>() as u32,
+            Some(&mut bytes_returned),
+            None,
+        )
+    }
+    .map_err(|err| {
+        sysinfo_debug!("Error: DeviceIoControl(IOCTL_DISK_PERFORMANCE) = {:?}", err);
+        err
+    })
+    .ok()?;
+
+    Some((
+        disk_perf.BytesRead.try_into().ok()?,
+        disk_perf.BytesWritten.try_into().ok()?,
+    ))
 }

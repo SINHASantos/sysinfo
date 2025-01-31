@@ -2,14 +2,15 @@
 
 // This test is used to ensure that the networks are not loaded by default.
 
+#[cfg(feature = "network")]
 #[test]
 fn test_networks() {
-    use sysinfo::{NetworksExt, SystemExt};
+    use sysinfo::Networks;
 
-    if sysinfo::System::IS_SUPPORTED {
-        let s = sysinfo::System::new();
-        assert_eq!(s.networks().iter().count(), 0);
-        let s = sysinfo::System::new_all();
-        assert!(s.networks().iter().count() > 0);
+    if sysinfo::IS_SUPPORTED_SYSTEM {
+        let mut n = Networks::new();
+        assert_eq!(n.iter().count(), 0);
+        n.refresh(false);
+        assert!(n.iter().count() > 0);
     }
 }

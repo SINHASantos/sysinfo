@@ -1,36 +1,79 @@
 // Take a look at the license at the top of the repository in the LICENSE file.
 
-use winapi::shared::minwindef::FILETIME;
-use winapi::um::winnt::LPWSTR;
+#[cfg(feature = "disk")]
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ACCESS_RIGHTS, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 
-use std::time::SystemTime;
-
-#[inline]
-pub(crate) fn filetime_to_u64(f: FILETIME) -> u64 {
-    (f.dwHighDateTime as u64) << 32 | (f.dwLowDateTime as u64)
-}
-
-#[inline]
-pub(crate) fn get_now() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|n| n.as_secs())
-        .unwrap_or(0)
-}
-
-pub(crate) unsafe fn to_str(p: LPWSTR) -> String {
-    let mut i = 0;
-
-    loop {
-        let c = *p.offset(i);
-        if c == 0 {
-            break;
-        }
-        i += 1;
+#[cfg(any(feature = "user", feature = "system"))]
+pub(crate) unsafe fn to_utf8_str(p: windows::core::PWSTR) -> String {
+    if p.is_null() {
+        return String::new();
     }
-    let s = std::slice::from_raw_parts(p, i as _);
-    String::from_utf16(s).unwrap_or_else(|_e| {
+
+    p.to_string().unwrap_or_else(|_e| {
         sysinfo_debug!("Failed to convert to UTF-16 string: {}", _e);
         String::new()
     })
+}
+
+cfg_if! {
+    if #[cfg(any(feature = "disk", feature = "system"))] {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use std::ops::Deref;
+
+        pub(crate) struct HandleWrapper(pub(crate) HANDLE);
+
+        impl HandleWrapper {
+            #[cfg(feature = "system")]
+            pub(crate) fn new(handle: HANDLE) -> Option<Self> {
+                if handle.is_invalid() {
+                    None
+                } else {
+                    Some(Self(handle))
+                }
+            }
+
+            #[cfg(feature = "disk")]
+            pub(crate) unsafe fn new_from_file(
+                drive_name: &[u16],
+                open_rights: FILE_ACCESS_RIGHTS,
+            ) -> Option<Self> {
+                let lpfilename = windows::core::PCWSTR::from_raw(drive_name.as_ptr());
+                let handle = CreateFileW(
+                    lpfilename,
+                    open_rights.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None,
+                    OPEN_EXISTING,
+                    Default::default(),
+                    HANDLE::default(),
+                )
+                .ok()?;
+                if handle.is_invalid() {
+                    sysinfo_debug!(
+                        "Expected handle to {:?} to be valid",
+                        String::from_utf16_lossy(drive_name)
+                    );
+                    None
+                } else {
+                    Some(Self(handle))
+                }
+            }
+        }
+
+        impl Deref for HandleWrapper {
+            type Target = HANDLE;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl Drop for HandleWrapper {
+            fn drop(&mut self) {
+                let _err = unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
 }

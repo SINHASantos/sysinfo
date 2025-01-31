@@ -1,36 +1,36 @@
 // Take a look at the license at the top of the repository in the LICENSE file.
 
-use crate::sys::tools::KeyHandler;
-use crate::{CpuExt, CpuRefreshKind, LoadAvg};
+use crate::{Cpu, CpuRefreshKind, LoadAvg};
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::io::Error;
 use std::mem;
 use std::ops::DerefMut;
-use std::ptr::null_mut;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
-use ntapi::ntpoapi::PROCESSOR_POWER_INFORMATION;
-
-use winapi::shared::minwindef::FALSE;
-use winapi::shared::winerror::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
-use winapi::um::handleapi::CloseHandle;
-use winapi::um::pdh::{
+use windows::core::{s, PCSTR, PCWSTR, PSTR};
+use windows::Win32::Foundation::{
+    CloseHandle, BOOLEAN, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FALSE, HANDLE, TRUE,
+};
+use windows::Win32::System::Performance::{
     PdhAddEnglishCounterA, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-    PdhCollectQueryDataEx, PdhGetFormattedCounterValue, PdhOpenQueryA, PdhRemoveCounter,
-    PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
+    PdhCollectQueryDataEx, PdhEnumObjectsA, PdhGetFormattedCounterValue, PdhOpenQueryA,
+    PdhRemoveCounter, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PERF_DETAIL_NOVICE,
 };
-use winapi::um::powerbase::CallNtPowerInformation;
-use winapi::um::synchapi::CreateEventA;
-use winapi::um::sysinfoapi::GetLogicalProcessorInformationEx;
-use winapi::um::sysinfoapi::SYSTEM_INFO;
-use winapi::um::winbase::{RegisterWaitForSingleObject, INFINITE};
-use winapi::um::winnt::{
-    ProcessorInformation, RelationAll, RelationProcessorCore, BOOLEAN, HANDLE,
-    PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, PVOID, WT_EXECUTEDEFAULT,
+use windows::Win32::System::Power::{
+    CallNtPowerInformation, ProcessorInformation, PROCESSOR_POWER_INFORMATION,
+};
+use windows::Win32::System::SystemInformation::{self, GetSystemInfo};
+use windows::Win32::System::SystemInformation::{
+    GetLogicalProcessorInformationEx, RelationAll, RelationProcessorCore, SYSTEM_INFO,
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+};
+use windows::Win32::System::Threading::{
+    CreateEventA, RegisterWaitForSingleObject, INFINITE, WT_EXECUTEDEFAULT,
 };
 
-// This formula comes from linux's include/linux/sched/loadavg.h
+// This formula comes from Linux's include/linux/sched/loadavg.h
 // https://github.com/torvalds/linux/blob/345671ea0f9258f410eb057b9ced9cefbbe5dc78/include/linux/sched/loadavg.h#L20-L23
 #[allow(clippy::excessive_precision)]
 const LOADAVG_FACTOR_1F: f64 = 0.9200444146293232478931553241;
@@ -42,11 +42,13 @@ const LOADAVG_FACTOR_15F: f64 = 0.9944598480048967508795473394;
 const SAMPLING_INTERVAL: usize = 5;
 
 // maybe use a read/write lock instead?
-static LOAD_AVG: once_cell::sync::Lazy<Mutex<Option<LoadAvg>>> =
-    once_cell::sync::Lazy::new(|| unsafe { init_load_avg() });
+fn load_avg() -> &'static Mutex<Option<LoadAvg>> {
+    static LOAD_AVG: OnceLock<Mutex<Option<LoadAvg>>> = OnceLock::new();
+    LOAD_AVG.get_or_init(|| unsafe { init_load_avg() })
+}
 
 pub(crate) fn get_load_average() -> LoadAvg {
-    if let Ok(avg) = LOAD_AVG.lock() {
+    if let Ok(avg) = load_avg().lock() {
         if let Some(avg) = &*avg {
             return avg.clone();
         }
@@ -54,22 +56,22 @@ pub(crate) fn get_load_average() -> LoadAvg {
     LoadAvg::default()
 }
 
-unsafe extern "system" fn load_avg_callback(counter: PVOID, _: BOOLEAN) {
+unsafe extern "system" fn load_avg_callback(counter: *mut c_void, _: BOOLEAN) {
     let mut display_value = mem::MaybeUninit::<PDH_FMT_COUNTERVALUE>::uninit();
 
     if PdhGetFormattedCounterValue(
         counter as _,
         PDH_FMT_DOUBLE,
-        null_mut(),
+        None,
         display_value.as_mut_ptr(),
-    ) != ERROR_SUCCESS as _
+    ) != ERROR_SUCCESS.0
     {
         return;
     }
     let display_value = display_value.assume_init();
-    if let Ok(mut avg) = LOAD_AVG.lock() {
+    if let Ok(mut avg) = load_avg().lock() {
         if let Some(avg) = avg.deref_mut() {
-            let current_load = display_value.u.doubleValue();
+            let current_load = display_value.Anonymous.doubleValue;
 
             avg.one = avg.one * LOADAVG_FACTOR_1F + current_load * (1.0 - LOADAVG_FACTOR_1F);
             avg.five = avg.five * LOADAVG_FACTOR_5F + current_load * (1.0 - LOADAVG_FACTOR_5F);
@@ -81,62 +83,61 @@ unsafe extern "system" fn load_avg_callback(counter: PVOID, _: BOOLEAN) {
 
 unsafe fn init_load_avg() -> Mutex<Option<LoadAvg>> {
     // You can see the original implementation here: https://github.com/giampaolo/psutil
-    let mut query = null_mut();
+    let mut query = 0;
 
-    if PdhOpenQueryA(null_mut(), 0, &mut query) != ERROR_SUCCESS as _ {
+    if PdhOpenQueryA(PCSTR::null(), 0, &mut query) != ERROR_SUCCESS.0 {
         sysinfo_debug!("init_load_avg: PdhOpenQueryA failed");
         return Mutex::new(None);
     }
 
-    let mut counter: PDH_HCOUNTER = mem::zeroed();
-    if PdhAddEnglishCounterA(
-        query,
-        b"\\System\\Cpu Queue Length\0".as_ptr() as _,
-        0,
-        &mut counter,
-    ) != ERROR_SUCCESS as _
+    let mut counter = 0;
+    if PdhAddEnglishCounterA(query, s!("\\System\\Cpu Queue Length"), 0, &mut counter)
+        != ERROR_SUCCESS.0
     {
         PdhCloseQuery(query);
         sysinfo_debug!("init_load_avg: failed to get CPU queue length");
         return Mutex::new(None);
     }
 
-    let event = CreateEventA(null_mut(), FALSE, FALSE, b"LoadUpdateEvent\0".as_ptr() as _);
-    if event.is_null() {
-        PdhCloseQuery(query);
-        sysinfo_debug!("init_load_avg: failed to create event `LoadUpdateEvent`");
-        return Mutex::new(None);
-    }
+    let event = match CreateEventA(None, FALSE, FALSE, s!("LoadUpdateEvent")) {
+        Ok(ev) => ev,
+        Err(_) => {
+            PdhCloseQuery(query);
+            sysinfo_debug!("init_load_avg: failed to create event `LoadUpdateEvent`");
+            return Mutex::new(None);
+        }
+    };
 
-    if PdhCollectQueryDataEx(query, SAMPLING_INTERVAL as _, event) != ERROR_SUCCESS as _ {
+    if PdhCollectQueryDataEx(query, SAMPLING_INTERVAL as _, event) != ERROR_SUCCESS.0 {
         PdhCloseQuery(query);
         sysinfo_debug!("init_load_avg: PdhCollectQueryDataEx failed");
         return Mutex::new(None);
     }
 
-    let mut wait_handle = null_mut();
+    let mut wait_handle = HANDLE::default();
     if RegisterWaitForSingleObject(
         &mut wait_handle,
         event,
         Some(load_avg_callback),
-        counter as _,
+        Some(counter as *const c_void),
         INFINITE,
         WT_EXECUTEDEFAULT,
-    ) == 0
+    )
+    .is_ok()
     {
+        Mutex::new(Some(LoadAvg::default()))
+    } else {
         PdhRemoveCounter(counter);
         PdhCloseQuery(query);
         sysinfo_debug!("init_load_avg: RegisterWaitForSingleObject failed");
         Mutex::new(None)
-    } else {
-        Mutex::new(Some(LoadAvg::default()))
     }
 }
 
 struct InternalQuery {
-    query: PDH_HQUERY,
+    query: HANDLE,
     event: HANDLE,
-    data: HashMap<String, PDH_HCOUNTER>,
+    data: HashMap<String, HANDLE>,
 }
 
 unsafe impl Send for InternalQuery {}
@@ -146,15 +147,15 @@ impl Drop for InternalQuery {
     fn drop(&mut self) {
         unsafe {
             for (_, counter) in self.data.iter() {
-                PdhRemoveCounter(*counter);
+                PdhRemoveCounter(counter.0);
             }
 
-            if !self.event.is_null() {
-                CloseHandle(self.event);
+            if !self.event.is_invalid() {
+                let _err = CloseHandle(self.event);
             }
 
-            if !self.query.is_null() {
-                PdhCloseQuery(self.query);
+            if !self.query.is_invalid() {
+                PdhCloseQuery(self.query.0);
             }
         }
     }
@@ -165,13 +166,23 @@ pub(crate) struct Query {
 }
 
 impl Query {
-    pub fn new() -> Option<Query> {
-        let mut query = null_mut();
+    pub fn new(force_reload: bool) -> Option<Query> {
+        let mut query = 0;
         unsafe {
-            if PdhOpenQueryA(null_mut(), 0, &mut query) == ERROR_SUCCESS as i32 {
+            if force_reload {
+                PdhEnumObjectsA(
+                    PCSTR::null(),
+                    PCSTR::null(),
+                    PSTR::null(),
+                    &mut 0,
+                    PERF_DETAIL_NOVICE,
+                    TRUE,
+                );
+            }
+            if PdhOpenQueryA(PCSTR::null(), 0, &mut query) == ERROR_SUCCESS.0 {
                 let q = InternalQuery {
-                    query,
-                    event: null_mut(),
+                    query: HANDLE(query),
+                    event: HANDLE::default(),
                     data: HashMap::new(),
                 };
                 Some(Query { internal: q })
@@ -187,18 +198,16 @@ impl Query {
         if let Some(counter) = self.internal.data.get(name) {
             unsafe {
                 let mut display_value = mem::MaybeUninit::<PDH_FMT_COUNTERVALUE>::uninit();
-                let counter: PDH_HCOUNTER = *counter;
 
-                let ret = PdhGetFormattedCounterValue(
-                    counter,
+                return if PdhGetFormattedCounterValue(
+                    counter.0,
                     PDH_FMT_DOUBLE,
-                    null_mut(),
+                    None,
                     display_value.as_mut_ptr(),
-                ) as u32;
-                let display_value = display_value.assume_init();
-                return if ret == ERROR_SUCCESS as _ {
-                    let data = *display_value.u.doubleValue();
-                    Some(data as f32)
+                ) == ERROR_SUCCESS.0
+                {
+                    let display_value = display_value.assume_init();
+                    Some(display_value.Anonymous.doubleValue as f32)
                 } else {
                     sysinfo_debug!("Query::get: PdhGetFormattedCounterValue failed");
                     Some(0.)
@@ -215,10 +224,15 @@ impl Query {
             return false;
         }
         unsafe {
-            let mut counter: PDH_HCOUNTER = std::mem::zeroed();
-            let ret = PdhAddEnglishCounterW(self.internal.query, getter.as_ptr(), 0, &mut counter);
-            if ret == ERROR_SUCCESS as _ {
-                self.internal.data.insert(name.clone(), counter);
+            let mut counter = 0;
+            let ret = PdhAddEnglishCounterW(
+                self.internal.query.0,
+                PCWSTR::from_raw(getter.as_ptr()),
+                0,
+                &mut counter,
+            );
+            if ret == ERROR_SUCCESS.0 {
+                self.internal.data.insert(name.clone(), HANDLE(counter));
             } else {
                 sysinfo_debug!(
                     "Query::add_english_counter: failed to add counter '{}': {:x}...",
@@ -233,7 +247,7 @@ impl Query {
 
     pub fn refresh(&self) {
         unsafe {
-            if PdhCollectQueryData(self.internal.query) != ERROR_SUCCESS as _ {
+            if PdhCollectQueryData(self.internal.query.0) != ERROR_SUCCESS.0 {
                 sysinfo_debug!("failed to refresh CPU data");
             }
         }
@@ -241,26 +255,23 @@ impl Query {
 }
 
 pub(crate) struct CpusWrapper {
-    global: Cpu,
+    pub(crate) global: CpuUsage,
     cpus: Vec<Cpu>,
-    got_cpu_frequency: bool,
 }
 
 impl CpusWrapper {
     pub fn new() -> Self {
         Self {
-            global: Cpu::new_with_values("Total CPU".to_owned(), String::new(), String::new(), 0),
+            global: CpuUsage {
+                percent: 0f32,
+                key_used: None,
+            },
             cpus: Vec::new(),
-            got_cpu_frequency: false,
         }
     }
 
-    pub fn global_cpu(&self) -> &Cpu {
-        &self.global
-    }
-
-    pub fn global_cpu_mut(&mut self) -> &mut Cpu {
-        &mut self.global
+    pub fn global_cpu_usage(&self) -> f32 {
+        self.global.percent
     }
 
     pub fn cpus(&self) -> &[Cpu] {
@@ -269,16 +280,12 @@ impl CpusWrapper {
 
     fn init_if_needed(&mut self, refresh_kind: CpuRefreshKind) {
         if self.cpus.is_empty() {
-            let (cpus, vendor_id, brand) = super::tools::init_cpus(refresh_kind);
-            self.cpus = cpus;
-            self.global.vendor_id = vendor_id;
-            self.global.brand = brand;
-            self.got_cpu_frequency = refresh_kind.frequency();
+            self.cpus = init_cpus(refresh_kind);
         }
     }
 
     pub fn len(&mut self) -> usize {
-        self.init_if_needed(CpuRefreshKind::new());
+        self.init_if_needed(CpuRefreshKind::nothing());
         self.cpus.len()
     }
 
@@ -288,61 +295,66 @@ impl CpusWrapper {
     }
 
     pub fn get_frequencies(&mut self) {
-        if self.got_cpu_frequency {
-            return;
-        }
         let frequencies = get_frequencies(self.cpus.len());
 
         for (cpu, frequency) in self.cpus.iter_mut().zip(frequencies) {
-            cpu.set_frequency(frequency);
+            cpu.inner.set_frequency(frequency);
         }
-        self.got_cpu_frequency = true;
     }
 }
 
-#[doc = include_str!("../../md_doc/cpu.md")]
-pub struct Cpu {
+pub(crate) struct CpuUsage {
+    percent: f32,
+    pub(crate) key_used: Option<KeyHandler>,
+}
+
+impl CpuUsage {
+    pub(crate) fn set_cpu_usage(&mut self, value: f32) {
+        self.percent = value;
+    }
+}
+
+pub(crate) struct CpuInner {
     name: String,
-    cpu_usage: f32,
-    key_used: Option<KeyHandler>,
     vendor_id: String,
+    usage: CpuUsage,
     brand: String,
     frequency: u64,
 }
 
-impl CpuExt for Cpu {
-    fn cpu_usage(&self) -> f32 {
-        self.cpu_usage
+impl CpuInner {
+    pub(crate) fn cpu_usage(&self) -> f32 {
+        self.usage.percent
     }
 
-    fn name(&self) -> &str {
+    pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
-    fn frequency(&self) -> u64 {
+    pub(crate) fn frequency(&self) -> u64 {
         self.frequency
     }
 
-    fn vendor_id(&self) -> &str {
+    pub(crate) fn vendor_id(&self) -> &str {
         &self.vendor_id
     }
 
-    fn brand(&self) -> &str {
+    pub(crate) fn brand(&self) -> &str {
         &self.brand
     }
-}
 
-impl Cpu {
     pub(crate) fn new_with_values(
         name: String,
         vendor_id: String,
         brand: String,
         frequency: u64,
-    ) -> Cpu {
-        Cpu {
+    ) -> Self {
+        Self {
             name,
-            cpu_usage: 0f32,
-            key_used: None,
+            usage: CpuUsage {
+                percent: 0f32,
+                key_used: None,
+            },
             vendor_id,
             brand,
             frequency,
@@ -350,7 +362,7 @@ impl Cpu {
     }
 
     pub(crate) fn set_cpu_usage(&mut self, value: f32) {
-        self.cpu_usage = value;
+        self.usage.set_cpu_usage(value);
     }
 
     pub(crate) fn set_frequency(&mut self, value: u64) {
@@ -359,25 +371,24 @@ impl Cpu {
 }
 
 fn get_vendor_id_not_great(info: &SYSTEM_INFO) -> String {
-    use winapi::um::winnt;
     // https://docs.microsoft.com/fr-fr/windows/win32/api/sysinfoapi/ns-sysinfoapi-system_info
     unsafe {
-        match info.u.s().wProcessorArchitecture {
-            winnt::PROCESSOR_ARCHITECTURE_INTEL => "Intel x86",
-            winnt::PROCESSOR_ARCHITECTURE_MIPS => "MIPS",
-            winnt::PROCESSOR_ARCHITECTURE_ALPHA => "RISC Alpha",
-            winnt::PROCESSOR_ARCHITECTURE_PPC => "PPC",
-            winnt::PROCESSOR_ARCHITECTURE_SHX => "SHX",
-            winnt::PROCESSOR_ARCHITECTURE_ARM => "ARM",
-            winnt::PROCESSOR_ARCHITECTURE_IA64 => "Intel Itanium-based x64",
-            winnt::PROCESSOR_ARCHITECTURE_ALPHA64 => "RISC Alpha x64",
-            winnt::PROCESSOR_ARCHITECTURE_MSIL => "MSIL",
-            winnt::PROCESSOR_ARCHITECTURE_AMD64 => "(Intel or AMD) x64",
-            winnt::PROCESSOR_ARCHITECTURE_IA32_ON_WIN64 => "Intel Itanium-based x86",
-            winnt::PROCESSOR_ARCHITECTURE_NEUTRAL => "unknown",
-            winnt::PROCESSOR_ARCHITECTURE_ARM64 => "ARM x64",
-            winnt::PROCESSOR_ARCHITECTURE_ARM32_ON_WIN64 => "ARM",
-            winnt::PROCESSOR_ARCHITECTURE_IA32_ON_ARM64 => "Intel Itanium-based x86",
+        match info.Anonymous.Anonymous.wProcessorArchitecture {
+            SystemInformation::PROCESSOR_ARCHITECTURE_INTEL => "Intel x86",
+            SystemInformation::PROCESSOR_ARCHITECTURE_MIPS => "MIPS",
+            SystemInformation::PROCESSOR_ARCHITECTURE_ALPHA => "RISC Alpha",
+            SystemInformation::PROCESSOR_ARCHITECTURE_PPC => "PPC",
+            SystemInformation::PROCESSOR_ARCHITECTURE_SHX => "SHX",
+            SystemInformation::PROCESSOR_ARCHITECTURE_ARM => "ARM",
+            SystemInformation::PROCESSOR_ARCHITECTURE_IA64 => "Intel Itanium-based x64",
+            SystemInformation::PROCESSOR_ARCHITECTURE_ALPHA64 => "RISC Alpha x64",
+            SystemInformation::PROCESSOR_ARCHITECTURE_MSIL => "MSIL",
+            SystemInformation::PROCESSOR_ARCHITECTURE_AMD64 => "(Intel or AMD) x64",
+            SystemInformation::PROCESSOR_ARCHITECTURE_IA32_ON_WIN64 => "Intel Itanium-based x86",
+            SystemInformation::PROCESSOR_ARCHITECTURE_NEUTRAL => "unknown",
+            SystemInformation::PROCESSOR_ARCHITECTURE_ARM64 => "ARM x64",
+            SystemInformation::PROCESSOR_ARCHITECTURE_ARM32_ON_WIN64 => "ARM",
+            SystemInformation::PROCESSOR_ARCHITECTURE_IA32_ON_ARM64 => "Intel Itanium-based x86",
             _ => "unknown",
         }
         .to_owned()
@@ -459,8 +470,9 @@ pub(crate) fn get_vendor_id_and_brand(info: &SYSTEM_INFO) -> (String, String) {
     (get_vendor_id_not_great(info), String::new())
 }
 
+#[inline]
 pub(crate) fn get_key_used(p: &mut Cpu) -> &mut Option<KeyHandler> {
-    &mut p.key_used
+    &mut p.inner.usage.key_used
 }
 
 // From https://stackoverflow.com/a/43813138:
@@ -475,11 +487,12 @@ pub(crate) fn get_frequencies(nb_cpus: usize) -> Vec<u64> {
     unsafe {
         if CallNtPowerInformation(
             ProcessorInformation,
-            null_mut(),
+            None,
             0,
-            infos.as_mut_ptr() as _,
+            Some(infos.as_mut_ptr() as _),
             size as _,
-        ) == 0
+        )
+        .is_ok()
         {
             infos.set_len(nb_cpus);
             // infos.Number
@@ -494,29 +507,38 @@ pub(crate) fn get_frequencies(nb_cpus: usize) -> Vec<u64> {
 }
 
 pub(crate) fn get_physical_core_count() -> Option<usize> {
-    // we cannot use the number of cpus here to pre calculate the buf size
-    // GetLogicalCpuInformationEx with RelationProcessorCore passed to it not only returns
-    // the logical cores but also numa nodes
+    // We cannot use the number of cpus here to pre calculate the buf size.
+    // `GetLogicalCpuInformationEx` with `RelationProcessorCore` passed to it not only returns
+    // the logical cores but also numa nodes.
     //
     // GetLogicalCpuInformationEx: https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getlogicalprocessorinformationex
 
     let mut needed_size = 0;
     unsafe {
-        GetLogicalProcessorInformationEx(RelationAll, null_mut(), &mut needed_size);
+        // This function call will always return an error as it only returns "success" when it
+        // has written at least one item in the buffer (which it cannot do here).
+        let _err = GetLogicalProcessorInformationEx(RelationAll, None, &mut needed_size);
 
         let mut buf: Vec<u8> = Vec::with_capacity(needed_size as _);
 
         loop {
+            // Needs to be updated for `Vec::reserve` to actually add additional capacity if
+            // `GetLogicalProcessorInformationEx` fails because the buffer isn't big enough.
+            buf.set_len(needed_size as _);
+
             if GetLogicalProcessorInformationEx(
                 RelationAll,
-                buf.as_mut_ptr() as *mut _,
+                Some(buf.as_mut_ptr().cast()),
                 &mut needed_size,
-            ) == FALSE
+            )
+            .is_ok()
             {
+                break;
+            } else {
                 let e = Error::last_os_error();
                 // For some reasons, the function might return a size not big enough...
                 match e.raw_os_error() {
-                    Some(value) if value == ERROR_INSUFFICIENT_BUFFER as _ => {}
+                    Some(value) if value == ERROR_INSUFFICIENT_BUFFER.0 as i32 => {}
                     _ => {
                         sysinfo_debug!(
                             "get_physical_core_count: GetLogicalCpuInformationEx failed"
@@ -524,10 +546,24 @@ pub(crate) fn get_physical_core_count() -> Option<usize> {
                         return None;
                     }
                 }
-            } else {
-                break;
             }
-            buf.reserve(needed_size as usize - buf.capacity());
+            let reserve = if needed_size as usize > buf.capacity() {
+                needed_size as usize - buf.capacity()
+            } else {
+                1
+            };
+            needed_size = match needed_size.checked_add(reserve as _) {
+                Some(new_size) => new_size,
+                None => {
+                    sysinfo_debug!(
+                        "get_physical_core_count: buffer size is too big ({} + {})",
+                        needed_size,
+                        reserve,
+                    );
+                    return None;
+                }
+            };
+            buf.reserve(reserve);
         }
 
         buf.set_len(needed_size as _);
@@ -536,7 +572,7 @@ pub(crate) fn get_physical_core_count() -> Option<usize> {
         let raw_buf = buf.as_ptr();
         let mut count = 0;
         while i < buf.len() {
-            let p = &*(raw_buf.add(i) as PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
+            let p = &*(raw_buf.add(i) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
             i += p.Size as usize;
             if p.Relationship == RelationProcessorCore {
                 // Only count the physical cores.
@@ -544,5 +580,41 @@ pub(crate) fn get_physical_core_count() -> Option<usize> {
             }
         }
         Some(count)
+    }
+}
+
+fn init_cpus(refresh_kind: CpuRefreshKind) -> Vec<Cpu> {
+    unsafe {
+        let mut sys_info = SYSTEM_INFO::default();
+        GetSystemInfo(&mut sys_info);
+        let (vendor_id, brand) = get_vendor_id_and_brand(&sys_info);
+        let nb_cpus = sys_info.dwNumberOfProcessors as usize;
+        let frequencies = if refresh_kind.frequency() {
+            get_frequencies(nb_cpus)
+        } else {
+            vec![0; nb_cpus]
+        };
+        let mut ret = Vec::with_capacity(nb_cpus + 1);
+        for (nb, frequency) in frequencies.iter().enumerate() {
+            ret.push(Cpu {
+                inner: CpuInner::new_with_values(
+                    format!("CPU {}", nb + 1),
+                    vendor_id.clone(),
+                    brand.clone(),
+                    *frequency,
+                ),
+            });
+        }
+        ret
+    }
+}
+
+pub(crate) struct KeyHandler {
+    pub unique_id: String,
+}
+
+impl KeyHandler {
+    pub fn new(unique_id: String) -> Self {
+        Self { unique_id }
     }
 }

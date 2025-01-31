@@ -1,3 +1,309 @@
+# 0.33.1
+
+ * Linux: Fix components retrieval.
+ * Linux: Filter out more virtual file systems for `Disk` API.
+ * Linux/Android: Improve `System::long_os_version()`.
+ * Apple: Add missing CPU brands for iPhone and iPads.
+ * macOS: Improve system name retrieval in `System::long_os_version()`.
+ * Linux/macOS: Avoid trailing whitespace and consecutive whitespace in `System::long_os_version()`.
+ * Windows: Fix `User::groups`.
+ * Improve documentation for `System::name`, `System::kernel_version`, `System::os_version`, `System::long_os_version` and `System::distribution_id`.
+
+# 0.33.0
+
+ * Linux: Add more ARM vendor IDs.
+ * Linux: Improve CPU computation when refreshing a single process CPU usage.
+ * Windows: Fix CPU frequency not being refreshed.
+ * Windows: Improved components retrieval.
+ * Windows: Fix inconsistent `boot_time` information.
+ * Windows: Fix `User::groups`.
+ * macOS: Fix network data information being limited to 32 bits.
+ * macOS: Add newer macOS version for `System::long_os_version`.
+ * unix: Add support for network sub-interfaces.
+ * Use `std::env::consts::ARCH` as fallback for `System::cpu_arch`.
+ * Add disk I/O support provided through `Disk::usage`.
+ * Add `NetworkData::mtu`.
+ * Add `DiskRefreshKind` to have finer-grained disks refreshes.
+ * `Component::temperature` and `Component::max` now returns `Option<f32>`.
+ * `Users::refresh_list`, `Groups::refresh_list`, `Components::refresh_list`, `Networks::refresh_list` and `Disks::refresh_list` methods were renamed `refresh`.
+ * `*RefreshKind::new` methods were renamed `nothing`.
+ * Improve documentation for `DiskUsage::read_bytes`.
+ * Improve documentation for `Process::kill`.
+
+# 0.32.1
+
+ * Fix compilation error due to `libc` update.
+
+# 0.32.0
+
+ * Add new `Disk::is_read_only` API.
+ * Add new `remove_dead_processes` argument to `System::refresh_processes` and `System::refresh_processes_specifics`.
+ * macOS: Fix memory leak in disk refresh.
+
+# 0.31.4
+
+ * macOS: Force memory cleanup in disk list retrieval.
+
+# 0.31.3
+
+ * Raspberry Pi: Fix temperature retrieval.
+
+# 0.31.2
+
+ * Remove `bstr` dependency (needed for rustc development).
+
+# 0.31.1
+
+ * Downgrade version of `memchr` (needed for rustc development).
+
+# 0.31.0
+
+ * Split crate in features to only enable what you need.
+ * Remove `System::refresh_process`, `System::refresh_process_specifics` and `System::refresh_pids`
+methods.
+ * Add new argument of type `ProcessesToUpdate` to `System::refresh_processes` and `System::refresh_processes_specifics` methods.
+ * Add new `NetworkData::ip_networks` method.
+ * Add new `System::refresh_cpu_list` method.
+ * Global CPU now only contains CPU usage.
+ * Rename `TermalSensorType` to `ThermalSensorType`.
+ * Process names is now an `OsString`.
+ * Remove `System::global_cpu_info`.
+ * Add `System::global_cpu_usage`.
+ * macOS: Fix invalid CPU computation when single processes are refreshed one after the other.
+ * Windows: Fix virtual memory computation.
+ * Windows: Fix WoW64 parent process refresh.
+ * Linux: Retrieve RSS (Resident Set Size) memory for cgroups.
+
+# 0.30.13
+
+ * macOS: Fix segfault when calling `Components::refresh_list` multiple times.
+ * Windows: Fix CPU arch retrieval.
+
+# 0.30.12
+
+ * FreeBSD: Fix network interfaces retrieval (one was always missing).
+
+# 0.30.11
+
+ * macOS: Fix some invalid utf8 conversions.
+
+# 0.30.10
+
+ * Linux: Fix components not being listed anymore.
+
+# 0.30.9
+
+ * Linux/Windows: Performance improvements.
+ * Linux/macOS/FreeBSD: Parent process ID is updated if changed as expected.
+
+# 0.30.8
+
+ * Linux: Fix missing parallelization.
+ * Linux: Add `cargo` feature flag `linux-tmpfs` to list `tmpfs` mounts.
+ * macOS: Fix CPU usage returning `NaN`.
+ * `Components::refresh` is now parallelized.
+
+# 0.30.7
+
+ * Linux: Fix cgroup memory computation.
+ * FreeBSD: Fix documentation about disk usage.
+
+# 0.30.6
+
+ * macOS: Fix missing update of process run time.
+ * Add new `Groups` API.
+ * Improve documentation.
+
+# 0.30.5
+
+ * Windows: Correctly retrieve processes name on 32 bits platforms.
+ * Windows: Fix swap memory computation.
+
+# 0.30.4
+
+ * Windows: Fix misaligned read.
+
+# 0.30.3
+
+ * Improve dependency stack by updating the `windows` dependency.
+
+# 0.30.2
+
+ * Add `ThreadKind` enum.
+ * Add `Process::thread_kind` method.
+
+# 0.30.1
+
+ * Linux: Fix invalid memory information retrieval (virtual and resident set size were reversed).
+
+# 0.30.0
+
+ * Split `System` into subtypes: `Components`, `Disks`, `Networks` and `Users`.
+ * `brand`, `vendor_id` and `frequency` information is not set anymore on the global CPU.
+ * Unix: Fix endless loop in user groups retrieval.
+ * Unix/Windows: Fix infinite loop when retrieving various information because of bad usage
+   of `Vec::reserve`.
+ * Unix: Fix invalid usage of NULL pointer when retrieving user group name.
+ * Linux: Fix CPU name retrieval.
+ * Linux: Remove cgroup usage from memory computation.
+ * Linux: Add `linux-netdevs` feature to allow to retrieve network devices.
+ * Linux: Improve system memory information retrieval (using `statm` file instead of `stat`).
+ * Linux: Tasks are listed in processes.
+ * macOS: Correctly retrieve process root directory.
+ * Windows: Add warning that `System::load_average` is not working in documentation.
+ * Windows: Fix invalid use of NULL pointer when retrieving users groups.
+ * Windows: Correctly retrieve process root directory.
+ * Create new `System::cgroup_limits` method.
+ * Remove `System::refresh_system` method.
+ * `Disk::file_system` and `Disk::name` now return an `Option<&OsStr>`.
+ * Implement `Display` trait on `DiskKind`.
+ * Move from `winapi` to `windows` crate.
+ * Add `System::cpu_arch`.
+ * Add `System::refresh_pids` and `System::refresh_pids_specifics`.
+ * `System::boot_time`, `System::cpu_arch`, `System::distribution_id`, `System::host_name`,
+   `System::kernel_version`, `System::load_average`, `System::long_os_version`, `System::name`,
+   `System::os_version` and `System::uptime` are static methods.
+ * `ProcessRefreshKind` has a lot more of possibilities for better control over updates.
+ * Add new `UpdateKind` enum.
+ * Add new `MemoryRefreshKind` struct.
+ * Add new `System::refresh_memory_specifics` method.
+ * `Process::exe`, `Process::cwd` and `Process::root` return an `Option<&Path>`.
+ * `Process::tasks` method is available on all platforms.
+ * `Process::tasks` method returns a `HashSet<Pid>`.
+ * Move `System::IS_SUPPORTED`, `System::SUPPORTED_SIGNALS` and
+   `System::MINIMUM_CPU_UPDATE_INTERVAL` constants out of `System` directly at the crate top-level.
+ * Rename `IS_SUPPORTED` into `IS_SUPPORTED_SYSTEM`.
+ * Fix `serde` serialization.
+ * Add `System::refresh_cpu_frequency` and `System::refresh_cpu_all`.
+ * Fix `sysinfo.h` and C wrapper.
+ * Add a migration guide.
+
+# 0.29.11
+
+ * macOS: Fix bug when a user group doesn't have a name.
+
+# 0.29.10
+
+ * Linux: Correctly handle max memory value for cgroups.
+
+# 0.29.9
+
+ * Linux: Fix memory usage retrieval for cgroups.
+
+# 0.29.8
+
+ * Linux: Fix overflow bug.
+
+# 0.29.7
+
+ * macOS: Fix CPU frequency retrieval for M1 and M2.
+ * Linux: Add support for cgroups v1/v2 for memory.
+ * Windows: Fix processes name encoding issues.
+
+# 0.29.6
+
+ * Update minimum rust version to 1.63.
+ * Windows: Fix memory corruption when listing processes.
+ * Windows: Fix name inconsistency between `refresh_processes` and `refresh_process`.
+ * `Cargo.lock` is now included to prevent minimum rust version disruptions.
+
+# 0.29.5
+
+ * Windows: Remove some undefined behaviour when listing processes.
+ * <docs.rs>: Use `--generate-link-to-definition` option to have better source code pages.
+
+# 0.29.4
+
+ * Windows: Improve code to retrieve network interfaces.
+ * Improve serde documentation example.
+ * Fix some clippy lints.
+
+# 0.29.3
+
+ * Fix some documentation examples.
+
+# 0.29.2
+
+ * <docs.rs>: Generate documentation for all supported platforms.
+
+# 0.29.1
+
+ * Update `libc` version to 0.2.144.
+ * Linux/FreeBSD/macOS: Fix retrieval of users groups in multi-threaded context.
+
+# 0.29.0
+
+ * Add `ProcessExt::effective_user_id` and `ProcessExt::effective_group_id`.
+ * Rename `DiskType` into `DiskKind`.
+ * Rename `DiskExt::type_` into `DiskExt::kind`.
+ * macOS: Correctly handle `ProcessStatus` and remove public `ThreadStatus` field.
+ * Windows 11: Fix CPU core usage.
+
+# 0.28.4
+
+ * macOS: Improve CPU computation.
+ * Strengthen a process test (needed for debian).
+
+# 0.28.3
+
+ * FreeBSD/Windows: Add missing frequency for global CPU.
+ * macOS: Fix used memory computation.
+ * macOS: Improve available memory computation.
+ * Windows: Fix potential panic when getting process data.
+
+# 0.28.2
+
+ * Linux: Improve CPU usage computation.
+
+# 0.28.1
+
+ * macOS: Fix overflow when computing CPU usage.
+
+# 0.28.0
+
+ * Linux: Fix name and CPU usage for processes tasks.
+ * unix: Keep all users, even "not real" accounts.
+ * Windows: Use SID for Users ID.
+ * Fix C API.
+ * Disable default cdylib compilation.
+ * Add `serde` feature to enable serialization.
+ * Linux: Handle `Idle` state in `ProcessStatus`.
+ * Linux: Add brand and name of ARM CPUs.
+
+# 0.27.8
+
+ * macOS: Fix overflow when computing CPU usage.
+
+# 0.27.7
+
+ * macOS: Fix process CPU usage computation
+ * Linux: Improve ARM CPU `brand` and `name` information.
+ * Windows: Fix resource leak.
+ * Documentation improvements.
+
+# 0.27.6
+
+ * Make `MacAddr` public.
+
+# 0.27.5
+
+ * Linux: Improve compatibility with upcoming `libc` changes for musl targets.
+
+# 0.27.4
+
+ * Create `SystemExt::MINIMUM_CPU_UPDATE_INTERVAL` constant.
+ * Fix consecutive processes updates CPU usage computation.
+
+# 0.27.3
+
+ * macOS: Fix free/available memory computation.
+ * Fix processes_by_name* lifetimes
+
+# 0.27.2
+
+ * Linux: Fix consecutive process CPU usage updates.
+ * Linux: Ignore NFS disks.
+
 # 0.27.1
 
  * Unix systems: Fix network address segfault issue.
@@ -9,6 +315,10 @@
  * Implement `TryFrom<usize>` and `FromStr` for `Gid` and `Uid`.
  * Implement `TryFrom<usize>` for `Pid`.
  * Fix documentation of `System::new` about CPU list not loaded by default.
+
+# 0.26.9
+
+ * (backport) Linux: Improve compatibility with upcoming `libc` changes for musl targets.
 
 # 0.26.8
 
@@ -23,7 +333,7 @@
 # 0.26.6
 
  * Add `Process::wait`.
- * Add "Good pratice" entry into the crate level documentation and in the README.
+ * Add "Good practice" entry into the crate level documentation and in the README.
  * Linux: More precise used memory computation.
 
 # 0.26.5
@@ -98,7 +408,7 @@
 
 # 0.24.4
 
- * Windows: Fix `System::refresh_process` when required higher priviledges.
+ * Windows: Fix `System::refresh_process` when required higher privileges.
 
 # 0.24.3
 
@@ -395,7 +705,7 @@
 
 # 0.16.0
 
- * Windows: show removeable drives on Windows.
+ * Windows: show removable drives on Windows.
  * Switched to Rust 2018 edition.
  * Split `SystemExt::get_version` into `SystemExt::get_kernel_version` and `SystemExt::get_os_version`.
  * Windows: added support for `get_kernel_version` and `get_os_version`.
